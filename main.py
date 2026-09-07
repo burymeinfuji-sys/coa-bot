@@ -392,6 +392,24 @@ async def send_everyone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await broadcast_message(update, context, text)
 
 
+async def announcement(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_admin_user(update, context):
+        await update.message.reply_text("You are not authorized to use this command.")
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=PUBLIC_GROUP_ID,
+            text="Create polls using @COApollingbot",
+        )
+        await update.message.reply_text("✅ Announcement posted to the public channel.")
+    except Exception as e:
+        logger.error("Failed to post announcement to public channel: %s", e)
+        await update.message.reply_text(
+            "⚠️ I couldn't post the announcement to the public channel."
+        )
+
+
 async def receive_broadcast_text(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -422,6 +440,7 @@ def main() -> None:
     app.add_handler(CommandHandler("poll", poll_command))
     app.add_handler(CommandHandler("chatid", chatid))
     app.add_handler(CommandHandler("send_everyone", send_everyone))
+    app.add_handler(CommandHandler("annc", announcement))
     app.add_handler(MessageHandler(filters.POLL, receive_poll))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, receive_broadcast_text)

@@ -9,7 +9,11 @@ import os
 import uuid
 import logging
 import time
+import asyncio
+import json
+from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Forbidden, RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -41,16 +45,54 @@ logger = logging.getLogger(__name__)
 pending_polls: dict[str, dict] = {}
 
 # ---------------------------------------------------------------------------
+# Users who have started or used the bot. Persisted so broadcasts survive
+# workflow restarts.
+# ---------------------------------------------------------------------------
+USERS_FILE = Path(__file__).with_name("users.json")
+
+
+def load_known_users() -> set[int]:
+    try:
+        return {int(user_id) for user_id in json.loads(USERS_FILE.read_text())}
+    except FileNotFoundError:
+        return set()
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.warning("Could not read user registry: %s", e)
+        return set()
+
+
+def save_known_users() -> None:
+    temporary_file = USERS_FILE.with_suffix(".tmp")
+    temporary_file.write_text(json.dumps(sorted(known_users)))
+    temporary_file.replace(USERS_FILE)
+
+
+known_users: set[int] = load_known_users()
+
+
+def remember_private_user(update: Update) -> None:
+    if (
+        update.effective_chat
+        and update.effective_chat.type == "private"
+        and update.effective_user
+        and update.effective_user.id not in known_users
+    ):
+        known_users.add(update.effective_user.id)
+        save_known_users()
+
+# ---------------------------------------------------------------------------
 # Cooldown store: user_id → timestamp of last submission
 # ---------------------------------------------------------------------------
 COOLDOWN_SECONDS = 30
 last_submission: dict[int, float] = {}
+pending_broadcast_admins: set[int] = set()
 
 
 # ---------------------------------------------------------------------------
 # /start
 # ---------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    remember_private_user(update)
     await update.message.reply_text(
         "👋 Welcome!\n\n"
         "Use /poll to learn how to submit a poll for review."
@@ -61,6 +103,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # /poll — instructions
 # ---------------------------------------------------------------------------
 async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    remember_private_user(update)
     await update.message.reply_text(
         "📊 *How to submit a poll:*\n\n"
         "1️⃣ Tap the 📎 *attachment* icon in this chat\n"
@@ -77,6 +120,7 @@ async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # /chatid — debug helper (run inside a group to get its ID)
 # ---------------------------------------------------------------------------
 async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    remember_private_user(update)
     cid = update.effective_chat.id
     await update.message.reply_text(
         f"🆔 This chat's ID is:\n`{cid}`\n\n"
@@ -95,6 +139,8 @@ async def receive_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Only accept polls sent in private chat (DMs)
     if update.effective_chat.type != "private":
         return
+
+    remember_private_user(update)
 
     poll = update.message.poll
     if poll is None:
@@ -232,6 +278,109 @@ async def handle_admin_decision(
 
 
 # ---------------------------------------------------------------------------
+# Admin: broadcast a custom message to all users who have used the bot
+# ---------------------------------------------------------------------------
+async def is_admin_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if user is None:
+        return False
+
+    try:
+        member = await context.bot.get_chat_member(ADMIN_GROUP_ID, user.id)
+        return member.status in {"administrator", "creator"}
+    except Exception as e:
+        logger.warning("Could not verify admin user %s: %s", user.id, e)
+        return False
+
+
+async def broadcast_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+) -> None:
+    recipients = list(known_users)
+    if not recipients:
+        await update.message.reply_text("There are no registered users to message yet.")
+        return
+
+    sent = 0
+    failed = 0
+    blocked_users: set[int] = set()
+
+    for user_id in recipients:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text)
+            sent += 1
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            try:
+                await context.bot.send_message(chat_id=user_id, text=text)
+                sent += 1
+            except Exception as retry_error:
+                failed += 1
+                logger.warning("Could not broadcast to user %s: %s", user_id, retry_error)
+        except Forbidden:
+            failed += 1
+            blocked_users.add(user_id)
+        except Exception as e:
+            failed += 1
+            logger.warning("Could not broadcast to user %s: %s", user_id, e)
+
+        # Stay comfortably below Telegram's broadcast rate limit.
+        await asyncio.sleep(0.05)
+
+    if blocked_users:
+        known_users.difference_update(blocked_users)
+        save_known_users()
+
+    await update.message.reply_text(
+        f"📣 Broadcast complete.\n✅ Delivered: {sent}\n⚠️ Failed: {failed}"
+    )
+    logger.info("Broadcast sent to %s users; %s failed", sent, failed)
+
+
+async def send_everyone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    remember_private_user(update)
+
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Please use /send_everyone in the bot's private chat.")
+        return
+
+    if not await is_admin_user(update, context):
+        await update.message.reply_text("You are not authorized to use this command.")
+        return
+
+    text = " ".join(context.args).strip()
+    if not text:
+        pending_broadcast_admins.add(update.effective_user.id)
+        await update.message.reply_text(
+            "Send the message you want to broadcast in your next message.\n"
+            "Only administrators can use this feature."
+        )
+        return
+
+    await broadcast_message(update, context, text)
+
+
+async def receive_broadcast_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    remember_private_user(update)
+    user = update.effective_user
+    if (
+        user is None
+        or update.effective_chat.type != "private"
+        or user.id not in pending_broadcast_admins
+    ):
+        return
+
+    pending_broadcast_admins.discard(user.id)
+    if not await is_admin_user(update, context):
+        await update.message.reply_text("You are not authorized to use this command.")
+        return
+
+    await broadcast_message(update, context, update.message.text)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -240,7 +389,11 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("poll", poll_command))
     app.add_handler(CommandHandler("chatid", chatid))
+    app.add_handler(CommandHandler("send_everyone", send_everyone))
     app.add_handler(MessageHandler(filters.POLL, receive_poll))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, receive_broadcast_text)
+    )
     app.add_handler(
         CallbackQueryHandler(handle_admin_decision, pattern=r"^(accept|reject):")
     )

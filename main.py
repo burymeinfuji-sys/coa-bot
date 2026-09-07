@@ -11,7 +11,6 @@ import logging
 import time
 import asyncio
 import json
-import re
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import Forbidden, RetryAfter
@@ -30,7 +29,6 @@ from telegram.ext import (
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_GROUP_ID = int(os.environ["ADMIN_GROUP_ID"])
 PUBLIC_GROUP_ID = int(os.environ["PUBLIC_GROUP_ID"])
-BLOCKED_POLL_WORD = re.compile(r"\bwoken\b", re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -148,14 +146,6 @@ async def receive_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if poll is None:
         return
 
-    poll_text = " ".join([poll.question, *(option.text for option in poll.options)])
-    if BLOCKED_POLL_WORD.search(poll_text):
-        await update.message.reply_text(
-            "⚠️ This poll wasn't submitted because it contains a blocked term."
-        )
-        logger.info("Rejected poll containing blocked term from user %s", user.id)
-        return
-
     # Cooldown check
     now = time.time()
     last = last_submission.get(user.id, 0)
@@ -271,10 +261,7 @@ async def handle_admin_decision(
         try:
             await context.bot.send_message(
                 chat_id=poll["user_id"],
-                text=(
-                    f"❌ Your poll *{poll['question']}* was *rejected* by an admin."
-                ),
-                parse_mode="Markdown",
+                text=f"❌ Your poll \"{poll['question']}\" was rejected by an admin.",
             )
         except Exception as e:
             logger.warning("Could not DM user %s: %s", poll["user_id"], e)

@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 users.json
+pending_polls.json

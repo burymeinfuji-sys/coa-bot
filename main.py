@@ -40,9 +40,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# In-memory store: poll_id → {user_id, question, options}
+# Pending store: poll_id → {user_id, question, options}
 # ---------------------------------------------------------------------------
-pending_polls: dict[str, dict] = {}
+PENDING_POLLS_FILE = Path(__file__).with_name("pending_polls.json")
+
+
+def load_pending_polls() -> dict[str, dict]:
+    try:
+        data = json.loads(PENDING_POLLS_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.warning("Could not read pending poll registry: %s", e)
+        return {}
+
+
+def save_pending_polls() -> None:
+    temporary_file = PENDING_POLLS_FILE.with_suffix(".tmp")
+    temporary_file.write_text(json.dumps(pending_polls))
+    temporary_file.replace(PENDING_POLLS_FILE)
+
+
+pending_polls: dict[str, dict] = load_pending_polls()
 
 # ---------------------------------------------------------------------------
 # Users who have started or used the bot. Persisted so broadcasts survive
@@ -170,6 +190,7 @@ async def receive_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "options": [opt.text for opt in poll.options],
         "original_message_id": update.message.message_id,
     }
+    save_pending_polls()
 
     admin_msg = (
         f"📬 *New Poll Submission*\n\n"
@@ -200,6 +221,8 @@ async def receive_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         logger.info("Poll %s submitted by user %s", poll_id, user.id)
     except Exception as e:
+        pending_polls.pop(poll_id, None)
+        save_pending_polls()
         logger.error("Failed to send poll to admin group: %s", e)
         await update.message.reply_text(
             "⚠️ Something went wrong sending your poll to the admins. Please try again later."
@@ -220,7 +243,11 @@ async def handle_admin_decision(
 
     if poll is None:
         await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text("⚠️ This submission has already been processed.")
+        await query.message.reply_text(
+            "⚠️ This submission is no longer pending. It may already have been "
+            "processed, or it was created before pending polls were saved. "
+            "Please submit the poll again if it was not posted."
+        )
         return
 
     admin_name = query.from_user.full_name
@@ -252,10 +279,15 @@ async def handle_admin_decision(
         except Exception as e:
             logger.warning("Could not DM user %s: %s", poll["user_id"], e)
 
-        await query.edit_message_text(
-            text=query.message.text + f"\n\n✅ *Accepted* by {admin_name}",
-            parse_mode="Markdown",
-        )
+        pending_polls.pop(poll_id, None)
+        save_pending_polls()
+        try:
+            await query.edit_message_text(
+                text=query.message.text + f"\n\n✅ *Accepted* by {admin_name}",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning("Could not update accepted poll message: %s", e)
 
     elif action == "reject":
         try:
@@ -266,12 +298,15 @@ async def handle_admin_decision(
         except Exception as e:
             logger.warning("Could not DM user %s: %s", poll["user_id"], e)
 
-        await query.edit_message_text(
-            text=query.message.text + f"\n\n❌ *Rejected* by {admin_name}",
-            parse_mode="Markdown",
-        )
-
-    del pending_polls[poll_id]
+        pending_polls.pop(poll_id, None)
+        save_pending_polls()
+        try:
+            await query.edit_message_text(
+                text=query.message.text + f"\n\n❌ *Rejected* by {admin_name}",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning("Could not update rejected poll message: %s", e)
 
 
 # ---------------------------------------------------------------------------
